@@ -1,0 +1,530 @@
+---
+title: "Classifying Images of Handwritten Digits"
+date: "`r Sys.Date()`"
+author: Samuel Moijueh
+output:
+  html_document:
+    keep_md: true
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+---
+
+# Introduction
+This is an Exploratory Data Analysis of the classic MNIST dataset. The data is available to download at [Kaggle](https://www.kaggle.com/c/digit-recognizer). The goal is to correctly classify digits `(0-9)` from a database of tens of thousands of gray-scale, handwritten images.
+
+As a first step, I'll visualize a subset of the digits to get a sense of the data quality and to identify potential problems. Data preprocessing/cleaning will be performed if necessary. I'll then use `class:knn()` to train a k-nearest neighbor classifier. This model will be used as a benchmark for optimization. Next, I'll use `nabor::knn()` to store the training instances of the kNN algorithm in a KD tree data structure. This will improve the runtime performance of the model by providing faster lookup operations. To optimize the accuracy of the model, I will:
+
+1) reduce the dimensionality of the feature space by performing a principal component analysis. 
+2) fine-tune the value of `k` in knn by performing a 5-fold cross validation.
+
+# Set up Environment
+Load packages and import data files
+
+```{r, warning = FALSE}
+# Load Packages
+# vis
+library(knitr)    # dynamic report generation
+library(ggplot2)  # visualization
+library(scales)   # scale functions for visualization
+library(gridExtra) # multi-panel plots
+
+# wrangle
+library(EBImage)  # image manipulation/processing
+library(reshape2) # data frame manipulation
+library(kableExtra) # HTML table manipulation
+library(magrittr) # pipe commands
+
+# model
+library(class)    # kNN classification
+suppressMessages(library(nabor))    # kd tree implementation of kNN
+suppressMessages(library(caret))    # confusionMatrix 
+
+# Import MNIST training & test datasets
+train <- read.csv("../input/train.csv")
+train$label <- as.factor(train$label)
+test <- read.csv("../input/test.csv")
+```
+
+# Initial Exploration / Visualization
+
+If we look at the structure of the data, we see that `train.csv` has a `label` column ranging from 0 to 9, and 784 `pixel#` columns. Each pixel has a single pixel-value associated with it, indicating the lightness or darkness of that pixel, with higher numbers meaning darker. The pixel-value is an integer between 0 and 255, inclusive.
+
+The data documentation indicates that each image is 28 pixels in height and 28 pixels in width. The documentation describes in detail how the pixels for each digit are oriented in the CSV. With this information, I can quickly plot the pixel gray-scale intensity values to obtain an image of the digit.
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 1", out.width="50%"}
+# Create 28x28 matrix containing the pixel gray-scale intensity values
+m = matrix(unlist(train[12,-1]),nrow = 28, byrow = T)
+# Plot the image
+image(m,col=grey.colors(255), main = paste0("label = ",train[12,1]))
+```
+
+# Data Overview
+
+The image need to be rotated along the x-axis to be readable. The `EBImage` package can be used for image processing and spacial transformations. Let's visualize a subset of the data. 
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 2"}
+# set up plot
+par(mai=rep(0,4)) # no margins
+
+# layout the plots into a matrix w/ 12 columns, by row
+layout(matrix(1:144, ncol=12, byrow=T))
+
+for (i in 1:144) {
+  m <- rotate(matrix(unlist(train[i,-1]), 28,28, byrow = T), 270)
+  image(m,col=grey.colors(255), xaxt='n', yaxt='n')
+}
+```
+
+What do these images tell us?
+
+- **Image Size**: All of the images in the dataset are the same `28x28` size. This is great. We want all images to be normalized to the same size.
+- **Image Resolution**: The digits are low resolution, gray-scale images.
+- **No single hand-drawn digits are identical**: As in natural handwriting, no single digits are perfectly identical, even when drawn by the same individual. Images of the same digit can be superimposed on one another and they will still won't perfectly align.
+- **Digit variation**: The images appear to be drawn by different individuals.
+- **Digit typography**: There are differences in how digits are stylized. For example, the number 7 can be drawn with or without a horizontal line through it. The number 4 can be drawn with a "tophat". The number 2 can be drawn with a a loop towards the bottom. The number 9 can be drawn with a straight vertical bar or with a curve. This further adds to the variation.
+
+
+This is a lot to consider. Fortunately, we have over 40,000 labeled digits to train our supervised model.
+
+The features available in this classification problem are the pixel-value intensities and the labels. The classification model that immediately comes to mind (and certainly the most simple and intuitive) is K-Nearest Neighbor (kNN). Each digit's 28x28 pixels represents a set of features. These set of features can be mapped onto a feature space, and subsequently used to classify new digits based on its proximity to its k-nearest neighbor in the feature space.
+
+The strategy for setting up the data for modeling is as follows:
+
+- Convert the 28x28 matrix of pixel-values into a 784 length vector. Each training instance will consist of a 784 length vector and an associated class label.
+- We do not need to transform the data as we did before in visualization. The kNN algorithm interprets the digits as a set of feature vectors.
+- Classification is done by calculating the Euclidean distance of the testing instance to every training instance.
+- A label will be assigned to the testing instance based on the most common class among its k-nearest examples in the training set.
+
+# K-Nearest Neighbor
+
+## Train Model
+Let's split the training data into a smaller training set and validation set. The validation set will be used to optimize the kNN model.
+
+```{r, echo=TRUE}
+set.seed(42)
+# we will split the data using a 75/25, training/validation split
+sample_rows <- sample(nrow(train), nrow(train)*0.75)
+
+trainingSet <- train[sample_rows,]
+validationSet <- train[-sample_rows,]
+
+# function to track time in seconds
+current_time<-function(display_time_elapse=FALSE){
+  if (display_time_elapse){
+    return((Sys.time()))
+  } else {
+   return(as.numeric(Sys.time())) 
+  }
+}
+
+# train kNN model and record run time
+start <- current_time(TRUE)
+kNN_predictions <- class::knn(train = trainingSet[,-1], test = validationSet[,-1], cl = trainingSet[,1], k = 1)
+class_kNN_time <- current_time(TRUE) - start
+class_kNN_time
+
+```
+
+The kNN algorithm from the `class` package took a little over half an hour to train the model. Let's look at the accuracy of the classifier.
+
+## Confusion Matrix
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 3"}
+# construct confusion matrix
+cfm <- confusionMatrix(kNN_predictions, validationSet$label)
+
+# confusion matrix visualization
+ggplotConfusionMatrix <- function(m,model){
+  mytitle <- paste(model, "Confusion Matrix:", "Accuracy", percent_format()(m$overall[1]),
+                   "Kappa", percent_format()(m$overall[2]))
+  p <-
+    ggplot(data = as.data.frame(m$table),
+      aes(x = Prediction, y = Reference)) +
+      ylab("Actual Label") + 
+      xlab("Predicted Label") +
+      geom_tile(aes(fill = log(Freq)), color = "white") +
+      scale_fill_gradient(low = "white", high = "steelblue") +
+      geom_text(aes(x = Prediction, y = Reference, label = Freq)) +
+      theme(legend.position = "right") +
+      scale_x_discrete(limits = rev(levels(as.data.frame(m$table)$Prediction))) +
+      theme(legend.background = element_rect(color = 'black', fill = 'white', linetype='solid')) +
+      ggtitle(mytitle) + theme(plot.title = element_text(hjust = 0.5))
+  return(p)
+}
+
+# plot confusion matrix
+ggplotConfusionMatrix(cfm, "Vanilla kNN")
+```
+
+
+## Computational Complexity Analysis
+
+The kNN algoritm from the `class` package achieved an accuracy of $96.4\%$ when $k = 1$. The kNN model for the MNIST database has a fairly high baseline accuracy. Next, let's discuss the execution time of the model. The computational complexity of the kNN algorithm with $n$ pictures, $d$ pixels, and $k$ nearest neighbors is $$ \boxed{O(nd)} + O(nlogn) + O(k)$$
+
+kNN is generally slow at the testing portion $O(nd)$ of the algorithm. This bottleneck of the complexity comes from having to compute the Euclidean distance of the test instance to every instance in the training set. I read from this [blog post](https://booking.ai/k-nearest-neighbours-from-slow-to-fast-thanks-to-maths-bec682357ccd) that we can improve the time complexity of the algorithm by implementating a [KD tree](https://en.wikipedia.org/wiki/K-d_tree).
+
+The KD tree is a space-partioning data structure that dramatically improves the runtime performance of the classifier. The training instances are stored in a binary tree for effectively faster look up times. Consequently, unlike before, the test instance is not compared to *all* training examples. Instead the test instance is compared to $m<<n$ potential near neighbors. The insert and search operations of the KD tree have an average time complexity of $$O(nlogn)$$ where $n$ is the number of pictures.
+
+The [nabor](https://cran.r-project.org/web/packages/nabor/nabor.pdf) package stores the training instances in a KD tree and the kNN model is approximated. We will use the `nabor` package to re-train the model.
+
+# KD Tree kNN Algorithm
+
+## Train Model
+
+```{r, echo=TRUE}
+# train KD Tree kNN model and track runtime
+start <- current_time(TRUE)
+kd_treeModel <- nabor::knn(data = trainingSet[,-1], query = validationSet[,-1], k = 1)
+nabor_time <- current_time(TRUE) - start
+nabor_time
+```
+
+The kNN KD tree algorithm from the  `nabor` package took significantly less time to train and classify the data than the vanillla kNN model. Let's look at the accuracy of the classifier.
+
+## Confusion Matrix
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 4"}
+get_KD_tree_prediction_labels<-function(kd_tree, trainData){
+  
+  get_k_nearest_votes<-function(i,trainData,kd_tree){
+    k_nearest_votes <- trainData[c(kd_tree[i,]), 1]
+    tt <- table(k_nearest_votes)
+    most_common_label <- names(tt[which.max(tt)])
+    return(most_common_label)
+  }
+
+  count <- nrow(kd_tree)
+  
+  labeled_predictions <- NA
+  
+  for (i in 1:count){
+    labeled_predictions[i] <- get_k_nearest_votes(i,trainData,kd_tree)
+  }
+  labeled_predictions <- factor(labeled_predictions, levels = 0:9)
+  
+  return(labeled_predictions)
+}
+
+kd_tree_predictions <- get_KD_tree_prediction_labels(kd_treeModel$nn.idx,trainingSet)
+
+cfm <- confusionMatrix(kd_tree_predictions, validationSet$label)
+
+ggplotConfusionMatrix(cfm, "KD Tree kNN")
+```
+
+# Evaluate and Compare Models
+
+The results from Figures $3$ and $4$ above show that the KD Tree kNN Algorithm model has a better time complexity than the Vanilla kNN algortihm whilst maintaining the same level of accuracy. The confusion matrices of the two models are identical.
+
+As a proof of concept, we can plot the computational time complexity of both models with several $n$ test instance sizes.
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 5"}
+xnums <- c(10,50,100,250,375,500,750,1000,1250,1500,1750,2000, 2500, 3000)
+vanilla_knn <- rep(NA, length(xnums))
+knn_kd_tree <- rep(NA, length(xnums))
+
+get_execution_time<-function(n){
+  
+  start_time <- current_time()
+  predictions<-class::knn(trainingSet[,-1], validationSet[c(1:n),-1], trainingSet[,1], k = 1)
+  end_time <- current_time()
+  vanilla_knn_time <- end_time - start_time
+  
+  start_time <- current_time()
+  kd_treeModel <- nabor::knn(trainingSet[,-1], validationSet[c(1:n),-1], k = 1)
+  end_time <- current_time()
+  knn_kd_time <- end_time - start_time
+  output <- list(vanilla_knn_time, knn_kd_time)
+  return(output)  # runtime in seconds
+}
+
+for(i in xnums){
+  n <- match(i, xnums)
+  execution_times <- unlist(get_execution_time(i))
+  vanilla_knn[n] <- execution_times[1]
+  knn_kd_tree[n] <- execution_times[2]
+}
+
+time_df <- data.frame(xnums,vanilla_knn, knn_kd_tree)
+time_df_long <- melt(time_df, id="xnums")
+
+ggplot(data=time_df_long, aes(x=xnums, y=value, color=variable)) +
+  geom_line() + geom_point() +
+  xlab("Test Input Size (n)") +
+  ylab("Time (seconds)") +
+  ggtitle("Computational Time Complexity") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_discrete(name = "ML Model", labels = c("Vanilla kNN", "KD Tree kNN")) +
+  theme(legend.background = element_rect(color = 'black', fill = 'white', linetype='solid'))
+```
+
+The KD tree kNN model performs faster than the Vanilla implementation of kNN as the number of testing instances is increased.
+
+Let's optimize the KD Tree kNN model performance.
+
+# KD Tree kNN Model Optimization
+
++ Objective: Reduce the dimensionality of the feature space by performing a Principal Component Analysis.
++ Objective: Improve the accuracy of the model by optimizing for k in kNN. We will perform k-fold cross validation.
+
+## Principal Component Analysis (PCA)
+
+### Rational
+
+I read from a [blog post](https://towardsdatascience.com/dimensionality-reduction-does-pca-really-improve-classification-outcome-6e9ba21f0a32) that reducing the number of features can dramatically improve the classification outcome. In the tutorial, the author trained a model with $18$ features for binary classification. The first model was a neural network using all features. This model achieved an accuracy of $54.6\%$. Next he performed a PCA on the dataset to reduce the $18$ features to $8$ principal components. He made a new dataset with the $8$ principal components and re-built the neural network. The new model achieved an accuracy of $97.7\%$. It would be interesting to see if we can similarly improve the accuracy of our KD tree kNN model by PCA.
+
+Principal Component Analysis is a statistical technique for transforming a set of observations of possibly correlated variables into a set of linearly uncorrelated variables called principal components. By retaining principal components that explain a high proportion of the total variance, we effectively remove redundant features whilst minimizing the amount of information lost. PCA is not only a great dimensionality reduction technique, it can also be used for data compression to speed up the learning algorithm.
+
+A related topic for discussion is a phenomena called __Curse of Dimensionality__. This usually occurs in highly dimensional features spaces. As the number of features increase, the amount of data that we need to generalize accurately grows exponently. When there are too many features in the input space, the amount of data available to accurately train the model becomes sparse. 
+
+In our classification problem, each digit is represented by 784 features (28x28 resolution pixel values). Let's perform a principal component analysis to reduce the number of features.
+
+### Analysis 
+
+To begin the dimension reduction, we can remove pixels from the training data that contain whitespace among all images. These pixels correspond to the background of the images. These empty pixels do not help in the classification therefore we can confidently remove them.
+
+```{r, echo=TRUE}
+removeEmptyPixels<- function(trainData){
+ allmisscols <- apply(trainData,2, function(x)all(x==0))
+  colswithallmiss <-names(allmisscols[allmisscols>0])
+  trainDataFrame <- trainData[, !names(train) %in% colswithallmiss]
+  return(trainDataFrame)
+}
+
+trainDataFrame<-removeEmptyPixels(trainingSet)
+```
+
+Let's perform the principal component analysis and construct a data frame of the results.
+
+```{r, echo=TRUE}
+# principal components analysis using correlation matrix
+computePrincipalComponents<-function(trainData){
+  pca_df <- princomp(trainData[,-1], scores = T, cor=T)
+
+  # Compute the eigenvalues of principal components from the standard deviation
+  eig <- as.vector((pca_df$sdev)^2)
+
+  # compute variances of principal components
+  variance <- eig*100/sum(eig)
+
+  # compute the cumulative variance
+  cumvar <- cumsum(variance)
+
+  df <- data.frame(PC = c(1:length(eig)), Eigenvalue = eig,"Variance Explained" = variance, "Cumulative Variance Explained" = cumvar)
+  
+  return(df)
+}
+
+princomp_df<-computePrincipalComponents(trainDataFrame)
+
+```
+
+### Principal Component Results
+
+For dimension reduction, we will retain principal components with eigenvalues greater than 1. `Eigenvalues > 1` is a good heuristic rule of thumb. See `Figure 6`. 
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 6", out.width="100%"}
+knitr::include_graphics("../input/Reference.png")
+```
+
+Let's make a dataframe of the filtered principal components.
+
+```{r, echo=TRUE}
+# exclude rows from dataframe where eigenvalue < 1
+new_princomp_df <- princomp_df[princomp_df$Eigenvalue > 1,]
+```
+
+We can generate an HTML table of the filtered principal components. 
+
+```{r, echo=TRUE}
+kable(new_princomp_df) %>%
+  kable_styling(c("striped", "bordered", "responsive")) %>%
+  add_header_above(c("Principal Compnent Analysis Results" = 4)) %>%
+  row_spec(0, bold = T, color = "white", background = "#666") %>%
+  scroll_box(height = "400px")
+
+dim(new_princomp_df)
+```
+
+Previously we had $784$ features to train the classifcation model. After applying the `Eigenvalues > 1` rule, we are left with $159$ principal components. This is a huge dimensionality reduction.
+
+### Scree Plot
+
+We can visualize the variance explained by each principal component with a Scree Plot. For brevity, we will plot the percent variance of the first $10$ principal components.
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 7"}
+# Print the scree plot
+ggplotScreePlot<- function(df){
+  df <- df[1:10,]
+  p <- 
+    ggplot(df)  + 
+    geom_bar(aes(x=PC, y=Variance.Explained),stat="identity", fill="tan1", color="sienna3")+
+    geom_point(aes(x=PC, y=df$Variance.Explained ),stat="identity")+
+    geom_line(aes(x=PC, y=df$Variance.Explained ),stat="identity") +
+    geom_text(aes(label=paste0(round(Variance.Explained, 2),"%"), x=PC, y=Variance.Explained), color="black", vjust = -0.4, hjust = -0.15) +
+    ylab("Percent of Variance Explained") + xlab("Principal Components") +
+    ggtitle("PCA: Scree Plot") + theme(plot.title = element_text(hjust = 0.5))
+  return(p)
+}
+
+ggplotScreePlot(new_princomp_df)
+```
+
+### Re-train Model and Confusion Matrix
+
+Now that we've reduced the number of principal components, we can retrain the model.
+
+```{r, echo=TRUE}
+# Principal Component Analysis
+pca.result <- princomp(trainingSet[,-1], scores = T)
+train.pca <- pca.result$scores
+test.pca <- predict(pca.result, validationSet[,-1]) 
+
+num.principal.components <- 1:nrow(new_princomp_df)
+start <- current_time(TRUE)
+kd_treeModel1 <- nabor::knn(data = train.pca[,num.principal.components], query = test.pca[,num.principal.components], k=1)
+nabor_time <- current_time(TRUE) - start
+nabor_time
+kd_treeModel2 <- nabor::knn(data = train.pca[,c(1:49)], query = test.pca[,c(1:49)], k=1)
+```
+
+Reducing the number of features in the model dramatically speeds up the runtime performance of the classification algorithm. 
+
+Notice that I created two models. `kd_treeModel1` uses the first $159$ principal components; these are the principal components where `Eigenvalues > 1`. `kd_treeModel2` uses the first $49$ principal components. I determined this number empirically. Let's plot the Confusion Matrices. 
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Figure 8", out.width="100%"}
+
+kd_tree_predictions1 <- get_KD_tree_prediction_labels(kd_treeModel1$nn.idx,trainingSet)
+kd_tree_predictions2 <- get_KD_tree_prediction_labels(kd_treeModel2$nn.idx,trainingSet)
+
+cfm1 <- confusionMatrix(kd_tree_predictions1, validationSet$label)
+cfm2 <- confusionMatrix(kd_tree_predictions2, validationSet$label)
+
+p1<-ggplotConfusionMatrix(cfm1, "159 Principal Components")
+p2<-ggplotConfusionMatrix(cfm2, "49 Principal Components")
+grid.arrange(p1, p2, nrow = 2)
+```
+
+Recall the accuracy before was $96.4\%$. Using the first $159$ principal components achieved an accuracy of $96.7\%$. Using the first $49$ principal components achieved an accuracy of $97.2\%$. 
+
+Note that there are a number of heuristics that we could have used to determine the number of principal components to retain in the model. For instance, we could have taken the first `k` eigenvectors that captured at least $85\%$ of the total cumulative variance. 
+
+Another heuristic criterion is the [Elbow Method](https://en.wikipedia.org/wiki/Determining_the_number_of_clusters_in_a_data_set). We can created a cumulative variance plot where the `y-axis` is the cumulative proportion of variance explained and the `x-axis` is the number of principal components. The number of principal components to retain would be at the point of diminishing returns. That is, the point where little variance is gained by retaining additional eigenvalues.
+
+For our analysis, we chose the first `k` eigenvectors that had `Eigenvalues > 1`. This heuristic criterion captured the first $159$ principal components. These principal components account for $82.6\%$ of the total cumulative variance.
+
+However, as we observed earlier, for high dimensionality problems, these heuristics may not necessarily be optimal. In the end, we determined empirically that the first `49` principal components achieved the highest accuracy in the model. 
+
+Let's fine-tune the model by optimizing for `k` in kNN. We will use 5-fold cross validation.
+
+## K-fold Cross Validation
+
++ Objective: Evaluate the accuracy of the kNN classifier with different values of k by cross validation. Optimize the knn model by selecting the `k` with the lowest misclassification error.
+
+```{r, echo=TRUE}
+# generate a randomized sample group column in the training data
+train$gp <- sample(nrow(train), replace = F)/nrow(train)
+# create equal k-fold subsets of the training data
+fold_one <- subset(train, train$gp <= 0.2)
+fold_two <- subset(train, train$gp > 0.2 & train$gp <= 0.4)
+fold_three <- subset(train, train$gp > 0.4 & train$gp <= 0.6)
+fold_four <- subset(train, train$gp > 0.6 & train$gp <= 0.8)
+fold_five <- subset(train, train$gp > 0.8 & train$gp <= 1)
+
+ldf <- list(fold_one, fold_two, fold_three, fold_four, fold_five)
+
+# k values in kNN
+K <- c(1,2,3,4,5,8,10,20,50,100,200)
+
+get_misclassification_error<-function(trainFold.pca,testFold.pca, trainFold, testFold,k_val,prcomp.used = 1:49){
+  
+  kd_treeModel <- nabor::knn(data = trainFold.pca[,prcomp.used], query = testFold.pca[,prcomp.used], k=k_val)
+  kd_tree_predictions <- get_KD_tree_prediction_labels(kd_treeModel$nn.idx,trainFold)
+  cfm <- confusionMatrix(kd_tree_predictions, factor(testFold$label, levels = c(0:9)))
+  return(1-cfm$overall[1][["Accuracy"]])
+}
+
+my_folds <- rep(list(NA), 5)
+m <- 1
+
+k <- rep(NA,length(K))
+for(k_val in K){
+  for(i in 1:length(ldf)){
+    trainFold<-do.call("rbind", ldf[-i])
+    testFold<- do.call("rbind", ldf[i])
+
+    pca.result <- princomp(trainFold[,-c(1,ncol(trainFold))], scores = T)
+    train.pca <- pca.result$scores
+    test.pca <- predict(pca.result, testFold[,-c(1,ncol(testFold))])
+
+    l <- get_misclassification_error(train.pca, test.pca, trainFold, testFold, k_val)
+    my_folds[[i]][m] <- l
+  }
+  k[m] <- k_val
+  m <- m + 1
+}
+```
+
+Let's make a dataframe of the cross validation results
+
+```{r, echo=TRUE}
+df1 <- data.frame(k = k, test_fold_one = my_folds[[1]], test_fold_two = my_folds[[2]], test_fold_three = my_folds[[3]],
+                  test_fold_four = my_folds[[4]], test_fold_five = my_folds[[5]])
+
+df1 <- cbind(df1, average = rowMeans(df1[,-1]))
+```
+
+We can generate an HTML table of the validation results.
+
+```{r, echo=TRUE}
+kable(df1) %>%
+  kable_styling(c("striped", "bordered")) %>%
+  add_header_above(c("Nearest Neighbors" = 1, "Misclassification Error (1 - Accuracy)" = 6))
+```
+
+The minimum misclassification error $(1-accuracy)$ occurs when $k=4$. With this, we can finally make predictions our test dataset.
+
+# Final Model
+
+Let's re-import the data and classify the test digits. For our submission, we will use the `nabor::knn` kd tree model with $k=4$ and the first $49$ principal components. 
+
+```{r}
+train <- read.csv("../input/train.csv")
+train$label <- as.factor(train$label)
+test <- read.csv("../input/test.csv")
+
+trainData <- removeEmptyPixels(train)
+
+# Compute the principal components
+pca.result <- princomp(trainData[,-1], scores = T)
+train.pca <- pca.result$scores
+test.pca <- predict(pca.result, test)
+
+# number of principal components
+num.principal.components <- 1:49
+# train model
+kd_treeModel <- nabor::knn(data = train.pca[,num.principal.components], query = test.pca[,num.principal.components], k=4)
+
+# get predictions
+Label <- get_KD_tree_prediction_labels(kd_treeModel$nn.idx,train)
+
+# write predictions to file
+ImageId = c(1:length(Label))
+submission <- data.frame(ImageId,Label)
+write.csv(submission, file = "../mnist_kdtree_kNN_submission.csv", row.names = F)
+```
+
+# Conclusion
+
+Our final model reached a maximum accuracy of ~$97\%$ on the test dataset.
+
+In summary, the default `class::kNN` classifier was optimized for both runtime performance and accuracy. The training set was a relatively high dimensional dataset. There were $784$ features (and the corresponding values) for each digit. I applied the technique of principal component analysis to compress the features into $49$ principal components. These principal components explained a cumulative percentage of over $55\%$ of the variance in the model. Next, I used the `nabor` package to improve the computational complexity of `class::kNN`. The `nabor::knn` function approximates the kNN algorithm by storing the training instances in a KD tree data structure. Lastly, the model was optimized for $k$ in `kNN` by using a 5-fold cross validation. The minimum misclassification error $(1-accuracy)$ occurs when $k=4$. The final model achieved a maximum accuracy of $97\%$ on the test dataset.
+
+== __Future Study__ ==
+
+There are several [classifiers](http://yann.lecun.com/exdb/mnist/) and deep learning models (eg. simple neural networks and convolutional neural networks) that we could have used for this classification problem. [LeCun et al. 1998](http://yann.lecun.com/exdb/publis/pdf/lecun-98.pdf), published a paper on _Gradient-Based Learning Applied to Document Recognition_ that explores the usage of more advance models for handwriting recognition. These are all great topics to explore for future study.
+
